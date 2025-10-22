@@ -149,7 +149,7 @@ def _fetch_crypto_bars(pairs: List[str], start: pd.Timestamp, end: pd.Timestamp,
         return pd.DataFrame()
 
 # -----------------------
-# Strategy bits
+# Strategy bits (NO logic changes)
 # -----------------------
 def _rsi(series: pd.Series, length: int) -> pd.Series:
     delta = series.diff()
@@ -255,20 +255,24 @@ def _rth_mask(index: pd.DatetimeIndex) -> pd.Series:
     """Regular Trading Hours mask for US equities: 09:30–16:00 ET, Mon–Fri."""
     et = _to_et(index)
     is_weekday = et.dayofweek < 5
-    # minutes since midnight
     minutes = et.hour * 60 + et.minute
     in_rth = (minutes >= 9*60+30) & (minutes < 16*60)
     return pd.Series(is_weekday & in_rth, index=index)
 
 def _hour_hist(series: pd.Series, max_bins: int = 6) -> str:
-    """Compact hour-of-day distribution string of non-NaN bars in ET."""
     et = _to_et(series.dropna().index)
     if len(et) == 0:
         return "none"
     hours = et.hour.value_counts().sort_index()
-    # show top bins
     top = hours.sort_values(ascending=False).head(max_bins)
     return ", ".join([f"{h}: {int(n)}" for h, n in top.items()])
+
+def _percentiles(s: pd.Series) -> str:
+    q = s.dropna().quantile([0, 0.05, 0.25, 0.5, 0.75, 0.95, 1.0])
+    if q.empty:
+        return "min=n/a p5=n/a p25=n/a p50=n/a p75=n/a p95=n/a max=n/a"
+    return ("min={:.2f} p5={:.2f} p25={:.2f} p50={:.2f} "
+            "p75={:.2f} p95={:.2f} max={:.2f}").format(*q.values)
 
 # -----------------------
 # Reporting
@@ -297,10 +301,12 @@ def summarize(
     else:
         roi_str, cagr_str = "N/A", "N/A"
 
-    # drawdown
+    # safer drawdown for contribution-style equity
     if not equity.empty:
-        peak = equity["equity"].cummax()
-        drawdown = (equity["equity"] / peak - 1.0)
+        eq = equity["equity"].copy()
+        # avoid division by zero early on
+        peak = eq.replace(0, np.nan).cummax().fillna(method="bfill").fillna(1.0)
+        drawdown = (eq / peak - 1.0)
         max_dd = float(drawdown.min() * 100.0)
     else:
         max_dd = 0.0
@@ -334,17 +340,33 @@ def summarize(
         pct = min(100.0, (spent / MONTHLY_CAP) * 100.0) if MONTHLY_CAP > 0 else 0.0
         print(f"{month}: ${spent:,.2f} / ${MONTHLY_CAP:,.2f} ({pct:.0f}%)")
 
-    # ---- Signal diagnostics ----
-    sig_counts = signals.sum()
-    print("\n--- Signal diagnostics (total TRUE bars) ---")
+    # ---- Condition decomposition & signal diagnostics ----
+    print("\n--- Condition decomposition (counts of TRUE bars) ---")
+    rsi_all  = close.apply(_rsi, length=RSI_LEN)
+    ma_s_all = close.rolling(MA_SHORT, min_periods=MA_SHORT).mean()
+    ma_l_all = close.rolling(MA_LONG,  min_periods=MA_LONG).mean()
+    cond_rsi = (rsi_all < 30)
+    cond_ma  = (ma_s_all < ma_l_all)
+    both     = signals  # already computed
+
     for sym in close.columns:
-        c = int(sig_counts.get(sym, 0))
-        if c == 0:
-            print(f"{sym:>8}: 0 signals")
+        c_r = int(cond_rsi[sym].sum())
+        c_m = int(cond_ma[sym].sum())
+        c_b = int(both[sym].sum())
+        print(f"{sym:>8}: RSI<30={c_r} | MA_short<MA_long={c_m} | BOTH (signals)={c_b}")
+
+    # ---- RSI distribution + top-oversold bars ----
+    print("\n--- RSI distribution & most-oversold timestamps (min→) ---")
+    for sym in close.columns:
+        rsi_s = rsi_all[sym]
+        print(f"{sym:>8}: {_percentiles(rsi_s)}")
+        # show up to 10 lowest-RSI timestamps (in ET)
+        lows = rsi_s.nsmallest(10).dropna()
+        if lows.empty:
+            print(f"{'':>8}  lows: none")
         else:
-            first_dt = signals.index[signals[sym]].min()
-            last_dt  = signals.index[signals[sym]].max()
-            print(f"{sym:>8}: {c} signals | first: {first_dt} | last: {last_dt}")
+            ts_list = [f"{_to_et(pd.DatetimeIndex([t]))[0]}={v:.2f}" for t, v in lows.items()]
+            print(f"{'':>8}  lows: " + "; ".join(ts_list))
 
     # ---- Monthly signal counts per asset ----
     print("\n--- Monthly signal counts ---")
@@ -355,7 +377,6 @@ def summarize(
         if nonzero.empty:
             print(f"{sym:>8}: none")
         else:
-            # show up to 12 most recent non-zero months
             recent = nonzero.tail(12)
             items = ", ".join([f"{m}:{int(v)}" for m, v in recent.items()])
             print(f"{sym:>8}: {items}")
