@@ -42,9 +42,6 @@ MA_LONG = int(os.getenv("MA_LONG", "240"))      # 240 x 15min
 # Data frequency
 BAR_MINUTES = int(os.getenv("BAR_MINUTES", "15"))  # 15-min bars
 
-# -----------------------
-# Helpers
-# -----------------------
 
 def _parse_dates() -> Tuple[pd.Timestamp, pd.Timestamp]:
     today = pd.Timestamp.now(tz=TZ).normalize()
@@ -64,7 +61,6 @@ def _alpaca_clients():
 def _fetch_stock_bars(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp, minutes: int) -> pd.DataFrame:
     stock_client, _ = _alpaca_clients()
     tf = TimeFrame(minutes, TimeFrameUnit.Minute)
-    # Alpaca supports batching multiple symbols per request
     req = StockBarsRequest(
         symbol_or_symbols=symbols,
         timeframe=tf,
@@ -96,13 +92,11 @@ def _fetch_crypto_bars(pairs: List[str], start: pd.Timestamp, end: pd.Timestamp,
         return pd.DataFrame()
     close = df.reset_index().pivot(index="timestamp", columns="symbol", values="close")
     close.index = pd.DatetimeIndex(close.index).tz_localize("UTC").tz_convert(TZ)
-    # Normalize crypto column names (BTC/USD -> BTCUSD) for consistency
     close.columns = [c.replace("/", "") for c in close.columns]
     return close.sort_index()
 
 
 def _rsi(series: pd.Series, length: int) -> pd.Series:
-    # Classic Wilder's RSI implementation
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -114,12 +108,12 @@ def _rsi(series: pd.Series, length: int) -> pd.Series:
 
 
 def build_signals(close: pd.DataFrame) -> pd.DataFrame:
-    # Compute RSI14, MA60, MA240 on 15-min bars (or configured minutes)
     rsi = close.apply(_rsi, length=RSI_LEN)
     ma_s = close.rolling(MA_SHORT, min_periods=MA_SHORT).mean()
     ma_l = close.rolling(MA_LONG, min_periods=MA_LONG).mean()
     signals = (rsi < 30) & (ma_s < ma_l)
     return signals.fillna(False)
+
 
 @dataclass
 class PortfolioState:
@@ -131,10 +125,9 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[pd.DataFra
     state = PortfolioState(cash=INIT_CASH, positions={sym: 0.0 for sym in close.columns})
     buys_count: Dict[str, int] = {sym: 0 for sym in close.columns}
 
-    equity_curve = []  # tuples (timestamp, equity)
+    equity_curve = []
 
     for ts, row in close.iterrows():
-        # process signals for this timestamp
         sigs = signals.loc[ts]
         for sym, fire in sigs.items():
             if fire:
@@ -142,11 +135,10 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[pd.DataFra
                 if not (np.isfinite(px) and px > 0):
                     continue
                 if state.cash >= BUY_AMOUNT:
-                    qty = BUY_AMOUNT / px  # fractional shares allowed
+                    qty = BUY_AMOUNT / px
                     state.cash -= BUY_AMOUNT
                     state.positions[sym] += qty
                     buys_count[sym] += 1
-        # compute equity
         equity = state.cash + float(np.nansum([row[s]*state.positions[s] for s in close.columns]))
         equity_curve.append((ts, equity))
 
@@ -176,7 +168,6 @@ def summarize(equity: pd.DataFrame, init_cash: float, state: PortfolioState, buy
     print("\n--- Sample of last 10 equity points ---")
     print(equity.tail(10).to_string())
     
-    # P&L by asset
     print("\n--- P&L by asset ---")
     for sym in close.columns:
         mv = state.positions[sym]*close[sym].iloc[-1]
@@ -185,11 +176,9 @@ def summarize(equity: pd.DataFrame, init_cash: float, state: PortfolioState, buy
 
 def main():
     start, end = _parse_dates()
-    # Fetch data
     stock_close = _fetch_stock_bars(STOCKS, start, end, BAR_MINUTES) if len(STOCKS) > 0 else pd.DataFrame()
     crypto_close = _fetch_crypto_bars(CRYPTO, start, end, BAR_MINUTES) if len(CRYPTO) > 0 else pd.DataFrame()
 
-    # Normalize symbol labels (BTC/USD -> BTCUSD already handled)
     all_close = []
     if not stock_close.empty:
         all_close.append(stock_close)
@@ -199,16 +188,14 @@ def main():
         raise RuntimeError("No price data returned. Check API keys, symbols, or date range.")
 
     close = pd.concat(all_close, axis=1).sort_index()
-    # Keep only requested instruments in intended labels
     desired = [*STOCKS, *[c.replace('/', '') for c in CRYPTO]]
     close = close.loc[:, [c for c in close.columns if c in desired]]
-    # Drop columns entirely NaN
     close = close.dropna(how='all', axis=1)
 
-    # Build signals and run
     signals = build_signals(close)
     equity, state, buys = run_backtest(close, signals)
     summarize(equity, INIT_CASH, state, buys, close)
+
 
 if __name__ == "__main__":
     main()
