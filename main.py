@@ -208,6 +208,9 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[
     monthly_spend: Dict[str, float] = {}  # "YYYY-MM" -> $
     first_buy_time: Dict[str, pd.Timestamp] = {sym: None for sym in close.columns}
 
+    # NEW: valuation uses forward-filled prices so RTH gaps don’t zero out ETFs
+    close_ffill = close.ffill()
+
     equity_curve = []
 
     for ts, row in close.iterrows():
@@ -216,7 +219,8 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[
         month_spent = monthly_spend.get(current_month, 0.0)
 
         if MONTHLY_CAP > 0 and month_spent >= MONTHLY_CAP:
-            portfolio_value = float(np.nansum([row[s]*state.positions[s] for s in close.columns]))
+            valuation_row = close_ffill.loc[ts]
+            portfolio_value = float(np.nansum([valuation_row[s]*state.positions[s] for s in close.columns]))
             equity_curve.append((ts, portfolio_value))
             continue
 
@@ -228,7 +232,7 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[
                 continue
             if MONTHLY_CAP > 0 and monthly_spend.get(current_month, 0.0) + BUY_AMOUNT > MONTHLY_CAP + 1e-9:
                 break
-            px = row.get(sym)
+            px = row.get(sym)  # execution uses actual bar; no ffill for trading logic
             if not (np.isfinite(px) and px > 0):
                 continue
             if BUY_AMOUNT <= 0:
@@ -247,7 +251,8 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[
             if MONTHLY_CAP > 0 and monthly_spend[current_month] >= MONTHLY_CAP:
                 break
 
-        portfolio_value = float(np.nansum([row[s]*state.positions[s] for s in close.columns]))
+        valuation_row = close_ffill.loc[ts]
+        portfolio_value = float(np.nansum([valuation_row[s]*state.positions[s] for s in close.columns]))
         equity_curve.append((ts, portfolio_value))
 
     equity_df = pd.DataFrame(equity_curve, columns=["timestamp", "equity"]).set_index("timestamp")
@@ -297,7 +302,11 @@ def summarize(
     start_dt, end_dt = close.index.min(), close.index.max()
     years = max((end_dt - start_dt).days / 365.25, 1e-9)
 
-    final_value = float(equity["equity"].iloc[-1]) if not equity.empty else 0.0
+    # Headline valuation uses forward-filled last prices
+    close_ffill = close.ffill()
+    end_px = close_ffill.iloc[-1]
+
+    final_value = float(np.nansum([end_px.get(sym, np.nan) * state.positions[sym] for sym in close.columns]))
     invested = state.total_invested
 
     if invested > 0:
@@ -312,14 +321,29 @@ def summarize(
     # safer drawdown for contribution-style equity
     if not equity.empty:
         eq = equity["equity"].copy()
-        # avoid division by zero early on
-        peak = eq.replace(0, np.nan).cummax().bfill().fillna(1.0)
+        peak = eq.replace(0, np.nan).cummax().bfill().fillna(1.0)  # FutureWarning-safe
         drawdown = (eq / peak - 1.0)
         max_dd = float(drawdown.min() * 100.0)
     else:
         max_dd = 0.0
 
-    print("\n========== FIDELITY BACKTEST (15m; BTC uses MA180/720; $ DCA; 1 buy/asset/day; monthly cap) ==========")
+    # ======= EASY-TO-FIND SUMMARY =======
+    total_buys = sum(buys.values())
+    print("\n==================== ACCOUNT SUMMARY ====================")
+    print(f"Window: {start_dt} → {end_dt}  ({years:.2f} years)   Timeframe: {BAR_MINUTES}m   TZ: {TZ}")
+    print(f"Universe: {list(close.columns)}")
+    print("---------------------------------------------------------")
+    print(f"Total Invested (contributions):   ${invested:,.2f}")
+    print(f"Final Portfolio Value:            ${final_value:,.2f}")
+    print(f"Net P&L:                          ${final_value - invested:,.2f}")
+    print(f"ROI (Total Return):               {roi_str}")
+    print(f"CAGR (Avg yearly return):         {cagr_str}")
+    print(f"Max Drawdown:                     {max_dd:.2f}%")
+    print(f"Total Buys Executed:              {total_buys}")
+    print("=========================================================\n")
+
+    # Legacy headline (kept, but now appears after the summary)
+    print("========== FIDELITY BACKTEST (15m; BTC uses MA180/720; $ DCA; 1 buy/asset/day; monthly cap) ==========")
     print(f"Feed: {'default' if not STOCK_FEED else STOCK_FEED} | Timeframe: {BAR_MINUTES}m | TZ: {TZ}")
     print(f"Window: {start_dt} → {end_dt}  ({years:.2f} years)")
     print(f"Universe: {list(close.columns)}")
@@ -329,13 +353,13 @@ def summarize(
     # ---- Per-asset ROI & CAGR ----
     print("\n--- Per-asset returns ---")
     for sym in close.columns:
-        px = close[sym].dropna()
-        mv = px.iloc[-1] * state.positions[sym] if not px.empty else 0.0
+        last_price = end_px.get(sym, np.nan)
+        mv = float(last_price * state.positions[sym]) if np.isfinite(last_price) else 0.0
         invested_sym = buys[sym] * BUY_AMOUNT
         if invested_sym > 0 and mv > 0:
-            roi_sym = (mv / invested_sym - 1) * 100.0
             fb = first_buy_time.get(sym)
             yrs_sym = max((end_dt - (fb if fb is not None else start_dt)).days / 365.25, 1e-9)
+            roi_sym = (mv / invested_sym - 1) * 100.0
             cagr_sym = ((mv / invested_sym) ** (1 / yrs_sym) - 1) * 100.0
             print(f"{sym:>8}: {buys[sym]:>4} buys | ROI {roi_sym:7.2f}% | CAGR {cagr_sym:7.2f}%/yr | MV ${mv:,.2f}")
         else:
