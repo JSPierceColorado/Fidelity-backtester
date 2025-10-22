@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.6
 FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -17,15 +18,6 @@ ENV INIT_CASH=10000 \
     CRYPTO="BTC/USD"
 
 # Health: quick import check
-RUN python - << 'PY' || true
-import importlib
-import sys
-for m in ["pandas","numpy","alpaca"]:
-    try:
-        importlib.import_module(m)
-        print(f"ok {m}")
-    except Exception as e:
-        print(f"fail {m}: {e}", file=sys.stderr)
-PY
+RUN python -c "import pandas, numpy, alpaca; print('imports ok')" || true
 
 CMD ["python","/app/main.py"]
