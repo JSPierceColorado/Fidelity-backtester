@@ -163,26 +163,34 @@ def _rsi(series: pd.Series, length: int) -> pd.Series:
 
 def build_signals(close: pd.DataFrame) -> pd.DataFrame:
     """
-    Base rule for non-BTC assets:
-        RSI14 < 30 AND MA_SHORT < MA_LONG  (e.g., 60 < 240 on 15m)
-    Special rule for BTC only:
-        RSI14 < 30 AND MA180 < MA720      (15m bars)
+    Non-BTC: RSI14 < 30 AND MA_SHORT < MA_LONG on 15m bars (computed on non-NaN bars per symbol),
+             then aligned back to the full 15m timeline.
+    BTC:     RSI14 < 30 AND MA180 < MA720 on 15m bars.
     """
-    # Base signals
-    rsi  = close.apply(_rsi, length=RSI_LEN)
-    ma_s = close.rolling(MA_SHORT, min_periods=MA_SHORT).mean()
-    ma_l = close.rolling(MA_LONG,  min_periods=MA_LONG).mean()
-    signals = ((rsi < 30) & (ma_s < ma_l)).fillna(False)
+    # Start with all-False
+    signals = pd.DataFrame(False, index=close.index, columns=close.columns)
 
-    # BTC override
+    # Identify BTC columns (override windows)
     btc_cols = [c for c in close.columns if c.upper() in ("BTCUSD", "BTCUSDT", "BTC")]
-    if btc_cols:
-        btc_ma_s = close[btc_cols].rolling(180, min_periods=180).mean()
-        btc_ma_l = close[btc_cols].rolling(720, min_periods=720).mean()
-        btc_signals = ((rsi[btc_cols] < 30) & (btc_ma_s < btc_ma_l)).fillna(False)
-        signals.loc[:, btc_cols] = btc_signals
 
-    return signals.fillna(False)
+    def _signals_one(sym: str, short_win: int, long_win: int) -> pd.Series:
+        px = close[sym].dropna()  # operate only on real 15m prints (e.g., RTH for ETFs)
+        if px.empty:
+            return pd.Series(False, index=close.index)
+        rsi = _rsi(px, RSI_LEN)
+        ma_s = px.rolling(short_win, min_periods=short_win).mean()
+        ma_l = px.rolling(long_win,  min_periods=long_win).mean()
+        sig = ((rsi < 30) & (ma_s < ma_l)).fillna(False)
+        # align back to the master 15m index; fill missing with False
+        return sig.reindex(close.index, fill_value=False)
+
+    for sym in close.columns:
+        if sym in btc_cols:
+            signals[sym] = _signals_one(sym, 180, 720)
+        else:
+            signals[sym] = _signals_one(sym, MA_SHORT, MA_LONG)
+
+    return signals
 
 @dataclass
 class PortfolioState:
@@ -305,7 +313,7 @@ def summarize(
     if not equity.empty:
         eq = equity["equity"].copy()
         # avoid division by zero early on
-        peak = eq.replace(0, np.nan).cummax().fillna(method="bfill").fillna(1.0)
+        peak = eq.replace(0, np.nan).cummax().bfill().fillna(1.0)
         drawdown = (eq / peak - 1.0)
         max_dd = float(drawdown.min() * 100.0)
     else:
@@ -342,31 +350,36 @@ def summarize(
 
     # ---- Condition decomposition & signal diagnostics ----
     print("\n--- Condition decomposition (counts of TRUE bars) ---")
+    # recompute on full frame for transparency (this includes NaNs and shows why we needed the patch)
     rsi_all  = close.apply(_rsi, length=RSI_LEN)
     ma_s_all = close.rolling(MA_SHORT, min_periods=MA_SHORT).mean()
     ma_l_all = close.rolling(MA_LONG,  min_periods=MA_LONG).mean()
     cond_rsi = (rsi_all < 30)
     cond_ma  = (ma_s_all < ma_l_all)
-    both     = signals  # already computed
-
     for sym in close.columns:
         c_r = int(cond_rsi[sym].sum())
         c_m = int(cond_ma[sym].sum())
-        c_b = int(both[sym].sum())
+        c_b = int(signals[sym].sum())
         print(f"{sym:>8}: RSI<30={c_r} | MA_short<MA_long={c_m} | BOTH (signals)={c_b}")
 
-    # ---- RSI distribution + top-oversold bars ----
+    # ---- RSI distribution + most-oversold bars ----
+    def _percentiles(s: pd.Series) -> str:
+        q = s.dropna().quantile([0, 0.05, 0.25, 0.5, 0.75, 0.95, 1.0])
+        if q.empty:
+            return "min=n/a p5=n/a p25=n/a p50=n/a p75=n/a p95=n/a max=n/a"
+        return ("min={:.2f} p5={:.2f} p25={:.2f} p50={:.2f} "
+                "p75={:.2f} p95={:.2f} max={:.2f}").format(*q.values)
+
     print("\n--- RSI distribution & most-oversold timestamps (min→) ---")
     for sym in close.columns:
         rsi_s = rsi_all[sym]
         print(f"{sym:>8}: {_percentiles(rsi_s)}")
-        # show up to 10 lowest-RSI timestamps (in ET)
         lows = rsi_s.nsmallest(10).dropna()
         if lows.empty:
             print(f"{'':>8}  lows: none")
         else:
-            ts_list = [f"{_to_et(pd.DatetimeIndex([t]))[0]}={v:.2f}" for t, v in lows.items()]
-            print(f"{'':>8}  lows: " + "; ".join(ts_list))
+            ts_list = [f\"{_to_et(pd.DatetimeIndex([t]))[0]}={v:.2f}\" for t, v in lows.items()]
+            print(f\"{'':>8}  lows: \" + \"; \".join(ts_list))
 
     # ---- Monthly signal counts per asset ----
     print("\n--- Monthly signal counts ---")
