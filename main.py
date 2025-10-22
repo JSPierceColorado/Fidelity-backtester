@@ -30,8 +30,8 @@ def _parse_float(name: str, default: float) -> float:
     except ValueError:
         return default
 
-BUY_AMOUNT  = _parse_float("BUY_AMOUNT", 50.0)          # $ per buy (default $50)
-MONTHLY_CAP = _parse_float("MONTHLY_CAP", 300.0)        # max invested per calendar month (all assets combined)
+BUY_AMOUNT  = _parse_float("BUY_AMOUNT", 50.0)          # $ per buy
+MONTHLY_CAP = _parse_float("MONTHLY_CAP", 300.0)        # shared cap per calendar month
 
 ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
@@ -42,12 +42,12 @@ CRYPTO = [c.strip().upper() for c in os.getenv("CRYPTO", "BTC/USD").split(',') i
 
 # Indicators (global defaults for non-BTC)
 RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
-MA_SHORT = int(os.getenv("MA_SHORT", "60"))     # 60 x 15min
-MA_LONG  = int(os.getenv("MA_LONG", "240"))     # 240 x 15min
+MA_SHORT = int(os.getenv("MA_SHORT", "60"))     # 60 x 15m
+MA_LONG  = int(os.getenv("MA_LONG", "240"))     # 240 x 15m
 
 # Data frequency
 BAR_MINUTES = int(os.getenv("BAR_MINUTES", "15"))  # 15-min bars
-# Optional Alpaca stock feed override (e.g., "iex" on free plan). Leave empty to use API default.
+# Optional Alpaca stock feed override (e.g., "iex"). Leave empty to use API default.
 STOCK_FEED = os.getenv("STOCK_FEED", "").strip()
 
 # -----------------------
@@ -96,8 +96,7 @@ def _stock_bars_request(symbols: List[str], minutes: int, start: pd.Timestamp, e
 
 def _fetch_stock_bars(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp, minutes: int) -> pd.DataFrame:
     stock_client, _ = _alpaca_clients()
-
-    # Try requested timeframe first (e.g., 15m)
+    # Try requested timeframe first
     try:
         req = _stock_bars_request(symbols, minutes, start, end)
         bars = stock_client.get_stock_bars(req)
@@ -111,7 +110,7 @@ def _fetch_stock_bars(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp
         close.index = _ensure_tz(close.index, TZ)
         return close.sort_index()
 
-    # Fallback: fetch 1m and resample to target minutes for CLOSE
+    # Fallback: 1m → resample to target minutes (last close)
     try:
         print(f"[INFO] No stock data at {minutes}m; falling back to 1m -> resample {minutes}m")
         req1 = _stock_bars_request(symbols, 1, start, end)
@@ -143,7 +142,7 @@ def _fetch_crypto_bars(pairs: List[str], start: pd.Timestamp, end: pd.Timestamp,
             return pd.DataFrame()
         close = df.reset_index().pivot(index="timestamp", columns="symbol", values="close")
         close.index = _ensure_tz(close.index, TZ)
-        close.columns = [c.replace("/", "") for c in close.columns]
+        close.columns = [c.replace("/", "") for c in close.columns]  # BTC/USD -> BTCUSD
         return close.sort_index()
     except Exception as e:
         print(f"[WARN] Crypto {minutes}m fetch error: {e}", file=sys.stderr)
@@ -169,13 +168,13 @@ def build_signals(close: pd.DataFrame) -> pd.DataFrame:
     Special rule for BTC only:
         RSI14 < 30 AND MA180 < MA720      (15m bars)
     """
-    # --- Base signals for all assets ---
+    # Base signals
     rsi  = close.apply(_rsi, length=RSI_LEN)
     ma_s = close.rolling(MA_SHORT, min_periods=MA_SHORT).mean()
     ma_l = close.rolling(MA_LONG,  min_periods=MA_LONG).mean()
     signals = ((rsi < 30) & (ma_s < ma_l)).fillna(False)
 
-    # --- BTC override: stricter MA windows (180 / 720 on the same 15m bars) ---
+    # BTC override
     btc_cols = [c for c in close.columns if c.upper() in ("BTCUSD", "BTCUSDT", "BTC")]
     if btc_cols:
         btc_ma_s = close[btc_cols].rolling(180, min_periods=180).mean()
@@ -193,14 +192,12 @@ class PortfolioState:
 def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[
     pd.DataFrame, PortfolioState, Dict[str, int], Dict[str, float], Dict[str, pd.Timestamp]
 ]:
-    # Contribution-only model (no cash account)
+    # Contribution-only (no cash)
     state = PortfolioState(positions={sym: 0.0 for sym in close.columns}, total_invested=0.0)
     buys_count: Dict[str, int] = {sym: 0 for sym in close.columns}
 
     last_buy_date: Dict[str, pd.Timestamp.date] = {sym: None for sym in close.columns}  # one buy per asset/day
-    monthly_spend: Dict[str, float] = {}  # "YYYY-MM" -> dollars invested this month
-
-    # track first executed buy timestamp per asset (for per-asset CAGR horizon)
+    monthly_spend: Dict[str, float] = {}  # "YYYY-MM" -> $
     first_buy_time: Dict[str, pd.Timestamp] = {sym: None for sym in close.columns}
 
     equity_curve = []
@@ -210,7 +207,6 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[
         current_month = ts.strftime("%Y-%m")
         month_spent = monthly_spend.get(current_month, 0.0)
 
-        # If monthly cap reached, skip buys this bar
         if MONTHLY_CAP > 0 and month_spent >= MONTHLY_CAP:
             portfolio_value = float(np.nansum([row[s]*state.positions[s] for s in close.columns]))
             equity_curve.append((ts, portfolio_value))
@@ -221,16 +217,15 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[
             if not fire:
                 continue
             if last_buy_date[sym] == current_date:
-                continue  # one buy per asset per day
+                continue
             if MONTHLY_CAP > 0 and monthly_spend.get(current_month, 0.0) + BUY_AMOUNT > MONTHLY_CAP + 1e-9:
-                break      # shared cap reached at this bar
+                break
             px = row.get(sym)
             if not (np.isfinite(px) and px > 0):
                 continue
             if BUY_AMOUNT <= 0:
                 continue
 
-            # Execute "buy" by adding fractional units; track invested contributions
             qty = BUY_AMOUNT / px
             state.positions[sym] += qty
             buys_count[sym] += 1
@@ -251,6 +246,31 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[
     return equity_df, state, buys_count, monthly_spend, first_buy_time
 
 # -----------------------
+# Diagnostics helpers (no strategy changes)
+# -----------------------
+def _to_et(ts: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    return ts.tz_convert("America/New_York")
+
+def _rth_mask(index: pd.DatetimeIndex) -> pd.Series:
+    """Regular Trading Hours mask for US equities: 09:30–16:00 ET, Mon–Fri."""
+    et = _to_et(index)
+    is_weekday = et.dayofweek < 5
+    # minutes since midnight
+    minutes = et.hour * 60 + et.minute
+    in_rth = (minutes >= 9*60+30) & (minutes < 16*60)
+    return pd.Series(is_weekday & in_rth, index=index)
+
+def _hour_hist(series: pd.Series, max_bins: int = 6) -> str:
+    """Compact hour-of-day distribution string of non-NaN bars in ET."""
+    et = _to_et(series.dropna().index)
+    if len(et) == 0:
+        return "none"
+    hours = et.hour.value_counts().sort_index()
+    # show top bins
+    top = hours.sort_values(ascending=False).head(max_bins)
+    return ", ".join([f"{h}: {int(n)}" for h, n in top.items()])
+
+# -----------------------
 # Reporting
 # -----------------------
 def summarize(
@@ -262,7 +282,6 @@ def summarize(
     signals: pd.DataFrame,
     first_buy_time: Dict[str, pd.Timestamp],
 ) -> None:
-    # overall timing / years
     start_dt, end_dt = close.index.min(), close.index.max()
     years = max((end_dt - start_dt).days / 365.25, 1e-9)
 
@@ -278,7 +297,7 @@ def summarize(
     else:
         roi_str, cagr_str = "N/A", "N/A"
 
-    # drawdown on contribution-value equity
+    # drawdown
     if not equity.empty:
         peak = equity["equity"].cummax()
         drawdown = (equity["equity"] / peak - 1.0)
@@ -287,7 +306,8 @@ def summarize(
         max_dd = 0.0
 
     print("\n========== FIDELITY BACKTEST (15m; BTC uses MA180/720; $ DCA; 1 buy/asset/day; monthly cap) ==========")
-    print(f"Window: {start_dt} → {end_dt}  ({years:.2f} years)  [{BAR_MINUTES}m bars, TZ={TZ}]")
+    print(f"Feed: {'default' if not STOCK_FEED else STOCK_FEED} | Timeframe: {BAR_MINUTES}m | TZ: {TZ}")
+    print(f"Window: {start_dt} → {end_dt}  ({years:.2f} years)")
     print(f"Universe: {list(close.columns)}")
     print(f"Total Invested: ${invested:,.2f} | Final Value: ${final_value:,.2f} | Net P&L: ${final_value - invested:,.2f}")
     print(f"ROI: {roi_str} | CAGR: {cagr_str} | Max DD: {max_dd:.2f}%")
@@ -300,13 +320,9 @@ def summarize(
         invested_sym = buys[sym] * BUY_AMOUNT
         if invested_sym > 0 and mv > 0:
             roi_sym = (mv / invested_sym - 1) * 100.0
-            # CAGR horizon from **first executed buy** for this asset
             fb = first_buy_time.get(sym)
-            if fb is None:
-                yrs_sym = years
-            else:
-                yrs_sym = max((end_dt - fb).days / 365.25, 1e-9)
-            cagr_sym = ( (mv / invested_sym) ** (1 / yrs_sym) - 1 ) * 100.0
+            yrs_sym = max((end_dt - (fb if fb is not None else start_dt)).days / 365.25, 1e-9)
+            cagr_sym = ((mv / invested_sym) ** (1 / yrs_sym) - 1) * 100.0
             print(f"{sym:>8}: {buys[sym]:>4} buys | ROI {roi_sym:7.2f}% | CAGR {cagr_sym:7.2f}%/yr | MV ${mv:,.2f}")
         else:
             print(f"{sym:>8}: {buys[sym]:>4} buys | ROI    N/A  | CAGR    N/A   | MV ${mv:,.2f}")
@@ -330,11 +346,29 @@ def summarize(
             last_dt  = signals.index[signals[sym]].max()
             print(f"{sym:>8}: {c} signals | first: {first_dt} | last: {last_dt}")
 
+    # ---- Monthly signal counts per asset ----
+    print("\n--- Monthly signal counts ---")
+    month_index = signals.index.strftime("%Y-%m")
+    for sym in close.columns:
+        counts = signals[sym].groupby(month_index).sum()
+        nonzero = counts[counts > 0]
+        if nonzero.empty:
+            print(f"{sym:>8}: none")
+        else:
+            # show up to 12 most recent non-zero months
+            recent = nonzero.tail(12)
+            items = ", ".join([f"{m}:{int(v)}" for m, v in recent.items()])
+            print(f"{sym:>8}: {items}")
+
     # ---- Data diagnostics ----
     print("\n--- Data diagnostics ---")
     for sym in close.columns:
         px = close[sym]
-        print(f"{sym:>8}: bars={len(px)} | NaN={px.isna().sum()} | first={px.index.min()} | last={px.index.max()}")
+        non_nan = px.notna()
+        rth = _rth_mask(px.index)
+        rth_non_nan = (non_nan & rth).sum()
+        rth_share = (rth_non_nan / max(rth.sum(), 1)) * 100.0
+        print(f"{sym:>8}: bars={len(px)} | NaN={px.isna().sum()} | first={px.index.min()} | last={px.index.max()} | RTH non-NaN share: {rth_share:.1f}% | ET hour hist: {_hour_hist(px)}")
 
     print("\n--- Sample of last 10 equity points ---")
     print(equity.tail(10).to_string())
