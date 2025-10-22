@@ -20,6 +20,8 @@ except Exception as e:
 TZ = os.getenv("TZ", "America/Denver")
 START_DATE = os.getenv("START_DATE")  # e.g. "2020-10-22"
 END_DATE   = os.getenv("END_DATE")    # e.g. "2025-10-22"
+# Lookback control if START_DATE is not provided
+BACKTEST_YEARS = int(os.getenv("BACKTEST_YEARS", "5"))
 
 def _parse_float(name: str, default: float) -> float:
     v = os.getenv(name)
@@ -54,13 +56,26 @@ STOCK_FEED = os.getenv("STOCK_FEED", "").strip()
 # Date helpers
 # -----------------------
 def _parse_dates() -> Tuple[pd.Timestamp, pd.Timestamp]:
-    """Default to a 5-year window ending today (TZ-aware) if START_DATE not provided."""
-    today = pd.Timestamp.now(tz=TZ).normalize()
-    end = pd.Timestamp(END_DATE, tz=TZ) if END_DATE else today
+    """
+    Resolve backtest window with clear precedence:
+
+    1) If START_DATE is provided:
+         - start = START_DATE (tz-aware)
+         - end   = END_DATE if provided else today (tz-aware)
+    2) Else (no START_DATE):
+         - end   = END_DATE if provided else today (tz-aware)
+         - start = end - BACKTEST_YEARS (years)
+    """
+    today_tz = pd.Timestamp.now(tz=TZ).normalize()
+    end = pd.Timestamp(END_DATE, tz=TZ) if END_DATE else today_tz
+
     if START_DATE:
         start = pd.Timestamp(START_DATE, tz=TZ)
+        print(f"[DATES] Using explicit dates: START_DATE={start}, END_DATE={end}")
     else:
-        start = end - pd.Timedelta(days=365 * 5)
+        start = end - pd.DateOffset(years=BACKTEST_YEARS)
+        print(f"[DATES] Using BACKTEST_YEARS={BACKTEST_YEARS}: start={start}, end={end}")
+
     return start, end
 
 # -----------------------
@@ -208,7 +223,7 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[
     monthly_spend: Dict[str, float] = {}  # "YYYY-MM" -> $
     first_buy_time: Dict[str, pd.Timestamp] = {sym: None for sym in close.columns}
 
-    # NEW: valuation uses forward-filled prices so RTH gaps don’t zero out ETFs
+    # Valuation uses forward-filled prices so RTH gaps don’t zero out ETFs
     close_ffill = close.ffill()
 
     equity_curve = []
@@ -321,13 +336,12 @@ def summarize(
     # safer drawdown for contribution-style equity
     if not equity.empty:
         eq = equity["equity"].copy()
-        peak = eq.replace(0, np.nan).cummax().bfill().fillna(1.0)  # FutureWarning-safe
+        peak = eq.replace(0, np.nan).cummax().bfill().fillna(1.0)
         drawdown = (eq / peak - 1.0)
         max_dd = float(drawdown.min() * 100.0)
     else:
         max_dd = 0.0
 
-    # ======= EASY-TO-FIND SUMMARY =======
     total_buys = sum(buys.values())
     print("\n==================== ACCOUNT SUMMARY ====================")
     print(f"Window: {start_dt} → {end_dt}  ({years:.2f} years)   Timeframe: {BAR_MINUTES}m   TZ: {TZ}")
@@ -342,7 +356,6 @@ def summarize(
     print(f"Total Buys Executed:              {total_buys}")
     print("=========================================================\n")
 
-    # Legacy headline (kept, but now appears after the summary)
     print("========== FIDELITY BACKTEST (15m; BTC uses MA180/720; $ DCA; 1 buy/asset/day; monthly cap) ==========")
     print(f"Feed: {'default' if not STOCK_FEED else STOCK_FEED} | Timeframe: {BAR_MINUTES}m | TZ: {TZ}")
     print(f"Window: {start_dt} → {end_dt}  ({years:.2f} years)")
@@ -374,7 +387,6 @@ def summarize(
 
     # ---- Condition decomposition & signal diagnostics ----
     print("\n--- Condition decomposition (counts of TRUE bars) ---")
-    # recompute on full frame for transparency (this includes NaNs and shows why we needed the patch)
     rsi_all  = close.apply(_rsi, length=RSI_LEN)
     ma_s_all = close.rolling(MA_SHORT, min_periods=MA_SHORT).mean()
     ma_l_all = close.rolling(MA_LONG,  min_periods=MA_LONG).mean()
