@@ -18,7 +18,7 @@ except Exception as e:
 # Config via ENV
 # -----------------------
 TZ = os.getenv("TZ", "America/Denver")
-START_DATE = os.getenv("START_DATE")  # e.g. "2024-10-22"
+START_DATE = os.getenv("START_DATE")  # e.g. "2020-10-22"
 END_DATE   = os.getenv("END_DATE")    # e.g. "2025-10-22"
 
 def _parse_float(name: str, default: float) -> float:
@@ -54,9 +54,14 @@ STOCK_FEED = os.getenv("STOCK_FEED", "").strip()
 # Date helpers
 # -----------------------
 def _parse_dates() -> Tuple[pd.Timestamp, pd.Timestamp]:
+    """Default to a 5-year window ending today (TZ-aware) if START_DATE not provided."""
     today = pd.Timestamp.now(tz=TZ).normalize()
     end = pd.Timestamp(END_DATE, tz=TZ) if END_DATE else today
-    start = pd.Timestamp(START_DATE, tz=TZ) if START_DATE else (end - pd.Timedelta(days=365))
+    if START_DATE:
+        start = pd.Timestamp(START_DATE, tz=TZ)
+    else:
+        # ~5 years
+        start = end - pd.Timedelta(days=365 * 5)
     return start, end
 
 # -----------------------
@@ -247,6 +252,7 @@ def summarize(
     buys: Dict[str, int],
     close: pd.DataFrame,
     monthly_spend: Dict[str, float],
+    signals: pd.DataFrame,
 ) -> None:
     final_value = float(equity["equity"].iloc[-1]) if not equity.empty else 0.0
     invested = state.total_invested
@@ -285,6 +291,18 @@ def summarize(
         pct = min(100.0, (spent / MONTHLY_CAP) * 100.0) if MONTHLY_CAP > 0 else 0.0
         print(f"{month}: ${spent:,.2f} / ${MONTHLY_CAP:,.2f} ({pct:.0f}%)")
 
+    # -------- Signal diagnostics (counts + first/last timestamps) --------
+    sig_counts = signals.sum()
+    print("\n--- Signal diagnostics (5y window; total bars where signal==TRUE) ---")
+    for sym in close.columns:
+        c = int(sig_counts.get(sym, 0))
+        if c == 0:
+            print(f"{sym:>8}: 0 signals")
+        else:
+            first_dt = signals.index[signals[sym]].min()
+            last_dt  = signals.index[signals[sym]].max()
+            print(f"{sym:>8}: {c} signals | first: {first_dt} | last: {last_dt}")
+
     print("\n--- Sample of last 10 equity points ---")
     print(equity.tail(10).to_string())
 
@@ -315,7 +333,7 @@ def main():
 
     signals = build_signals(close)
     equity, state, buys, monthly_spend = run_backtest(close, signals)
-    summarize(equity, state, buys, close, monthly_spend)
+    summarize(equity, state, buys, close, monthly_spend, signals)
 
 if __name__ == "__main__":
     main()
