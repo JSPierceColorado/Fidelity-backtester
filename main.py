@@ -362,14 +362,7 @@ def summarize(
         c_b = int(signals[sym].sum())
         print(f"{sym:>8}: RSI<30={c_r} | MA_short<MA_long={c_m} | BOTH (signals)={c_b}")
 
-    # ---- RSI distribution + most-oversold bars ----
-    def _percentiles(s: pd.Series) -> str:
-        q = s.dropna().quantile([0, 0.05, 0.25, 0.5, 0.75, 0.95, 1.0])
-        if q.empty:
-            return "min=n/a p5=n/a p25=n/a p50=n/a p75=n/a p95=n/a max=n/a"
-        return ("min={:.2f} p5={:.2f} p25={:.2f} p50={:.2f} "
-                "p75={:.2f} p95={:.2f} max={:.2f}").format(*q.values)
-
+    # ---- RSI distribution & most-oversold bars ----
     print("\n--- RSI distribution & most-oversold timestamps (min→) ---")
     for sym in close.columns:
         rsi_s = rsi_all[sym]
@@ -378,8 +371,8 @@ def summarize(
         if lows.empty:
             print(f"{'':>8}  lows: none")
         else:
-            ts_list = [f\"{_to_et(pd.DatetimeIndex([t]))[0]}={v:.2f}\" for t, v in lows.items()]
-            print(f\"{'':>8}  lows: \" + \"; \".join(ts_list))
+            ts_list = [f"{_to_et(pd.DatetimeIndex([t]))[0]}={v:.2f}" for t, v in lows.items()]
+            print(f"{'':>8}  lows: " + "; ".join(ts_list))
 
     # ---- Monthly signal counts per asset ----
     print("\n--- Monthly signal counts ---")
