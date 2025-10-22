@@ -40,7 +40,7 @@ ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
 STOCKS = [s.strip().upper() for s in os.getenv("STOCKS", "VIG,GLD,BND").split(',') if s.strip()]
 CRYPTO = [c.strip().upper() for c in os.getenv("CRYPTO", "BTC/USD").split(',') if c.strip()]
 
-# Indicators
+# Indicators (global defaults for non-BTC)
 RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
 MA_SHORT = int(os.getenv("MA_SHORT", "60"))     # 60 x 15min
 MA_LONG  = int(os.getenv("MA_LONG", "240"))     # 240 x 15min
@@ -159,10 +159,26 @@ def _rsi(series: pd.Series, length: int) -> pd.Series:
     return rsi.fillna(50)
 
 def build_signals(close: pd.DataFrame) -> pd.DataFrame:
+    """
+    Base rule for non-BTC assets:
+        RSI14 < 30 AND MA_SHORT < MA_LONG  (e.g., 60 < 240 on 15m)
+    Special rule for BTC only:
+        RSI14 < 30 AND MA180 < MA720      (15m bars)
+    """
+    # --- Base signals for all assets ---
     rsi  = close.apply(_rsi, length=RSI_LEN)
     ma_s = close.rolling(MA_SHORT, min_periods=MA_SHORT).mean()
     ma_l = close.rolling(MA_LONG,  min_periods=MA_LONG).mean()
-    signals = (rsi < 30) & (ma_s < ma_l)
+    signals = ((rsi < 30) & (ma_s < ma_l)).fillna(False)
+
+    # --- BTC override: stricter MA windows (180 / 720 on the same 15m bars) ---
+    btc_cols = [c for c in close.columns if c.upper() in ("BTCUSD", "BTCUSDT", "BTC")]
+    if btc_cols:
+        btc_ma_s = close[btc_cols].rolling(180, min_periods=180).mean()
+        btc_ma_l = close[btc_cols].rolling(720, min_periods=720).mean()
+        btc_signals = ((rsi[btc_cols] < 30) & (btc_ma_s < btc_ma_l)).fillna(False)
+        signals.loc[:, btc_cols] = btc_signals
+
     return signals.fillna(False)
 
 @dataclass
@@ -171,7 +187,7 @@ class PortfolioState:
     total_invested: float
 
 def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[pd.DataFrame, PortfolioState, Dict[str, int], Dict[str, float]]:
-    # No cash account: we simulate contributions ($BUY_AMOUNT) subject to constraints
+    # Contribution-only model (no cash account)
     state = PortfolioState(positions={sym: 0.0 for sym in close.columns}, total_invested=0.0)
     buys_count: Dict[str, int] = {sym: 0 for sym in close.columns}
 
@@ -186,7 +202,7 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[pd.DataFra
         month_spent = monthly_spend.get(current_month, 0.0)
 
         # If monthly cap reached, skip buys this bar
-        if month_spent >= MONTHLY_CAP:
+        if MONTHLY_CAP > 0 and month_spent >= MONTHLY_CAP:
             portfolio_value = float(np.nansum([row[s]*state.positions[s] for s in close.columns]))
             equity_curve.append((ts, portfolio_value))
             continue
@@ -197,8 +213,8 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[pd.DataFra
                 continue
             if last_buy_date[sym] == current_date:
                 continue  # one buy per asset per day
-            if monthly_spend.get(current_month, 0.0) >= MONTHLY_CAP:
-                break      # cap reached at this bar
+            if MONTHLY_CAP > 0 and monthly_spend.get(current_month, 0.0) + BUY_AMOUNT > MONTHLY_CAP + 1e-9:
+                break      # shared cap reached at this bar
             px = row.get(sym)
             if not (np.isfinite(px) and px > 0):
                 continue
@@ -213,7 +229,7 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[pd.DataFra
             monthly_spend[current_month] = monthly_spend.get(current_month, 0.0) + BUY_AMOUNT
             state.total_invested += BUY_AMOUNT
 
-            if monthly_spend[current_month] >= MONTHLY_CAP:
+            if MONTHLY_CAP > 0 and monthly_spend[current_month] >= MONTHLY_CAP:
                 break
 
         portfolio_value = float(np.nansum([row[s]*state.positions[s] for s in close.columns]))
@@ -248,7 +264,7 @@ def summarize(
     else:
         max_dd = 0.0
 
-    print("\n========== FIDELITY BACKTEST (15m RSI<30 & MA60<MA240; $50 DCA on signal; 1 buy/asset/day; $300 monthly cap) ==========")
+    print("\n========== FIDELITY BACKTEST (15m; BTC uses MA180/720; $ DCA on signal; 1 buy/asset/day; monthly cap) ==========")
     print(f"Window: {close.index.min()}  →  {close.index.max()}  [{BAR_MINUTES}m bars, TZ={TZ}]")
     print(f"Universe: {list(close.columns)}")
     print(f"Total Invested (contributions): ${invested:,.2f}")
@@ -266,7 +282,7 @@ def summarize(
     print("\n--- Monthly spend (applied vs cap) ---")
     for month in sorted(monthly_spend.keys()):
         spent = monthly_spend[month]
-        pct = min(100.0, (spent / MONTHLY_CAP) * 100.0 if MONTHLY_CAP > 0 else 0.0)
+        pct = min(100.0, (spent / MONTHLY_CAP) * 100.0) if MONTHLY_CAP > 0 else 0.0
         print(f"{month}: ${spent:,.2f} / ${MONTHLY_CAP:,.2f} ({pct:.0f}%)")
 
     print("\n--- Sample of last 10 equity points ---")
