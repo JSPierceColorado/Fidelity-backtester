@@ -20,9 +20,19 @@ except Exception as e:
 TZ = os.getenv("TZ", "America/Denver")
 START_DATE = os.getenv("START_DATE")  # e.g. "2024-10-22"
 END_DATE   = os.getenv("END_DATE")    # e.g. "2025-10-22"
-INIT_CASH  = float(os.getenv("INIT_CASH", "10000"))
-BUY_AMOUNT = float(os.getenv("BUY_AMOUNT", "50"))      # $ per signal
-MONTHLY_CAP = float(os.getenv("MONTHLY_CAP", "300"))   # max invested per calendar month
+# Robust parse: allow INIT_CASH="0" without crashing later
+def _parse_float(env_name: str, default: float) -> float:
+    v = os.getenv(env_name)
+    if v is None or v == "":
+        return default
+    try:
+        return float(v)
+    except ValueError:
+        return default
+
+INIT_CASH  = _parse_float("INIT_CASH", 10000.0)
+BUY_AMOUNT = _parse_float("BUY_AMOUNT", 50.0)         # $ per signal
+MONTHLY_CAP = _parse_float("MONTHLY_CAP", 300.0)      # max invested per calendar month
 
 ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
@@ -127,50 +137,43 @@ class PortfolioState:
     positions: Dict[str, float]
 
 
-def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[pd.DataFrame, PortfolioState, Dict[str, int]]:
+def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[pd.DataFrame, PortfolioState, Dict[str, int], Dict[str, float]]:
     state = PortfolioState(cash=INIT_CASH, positions={sym: 0.0 for sym in close.columns})
     buys_count: Dict[str, int] = {sym: 0 for sym in close.columns}
 
-    # New: enforce one buy per asset per day + monthly cap
+    # Enforce one buy per asset per day + monthly cap
     last_buy_date: Dict[str, pd.Timestamp.date] = {sym: None for sym in close.columns}
     monthly_spend: Dict[str, float] = {}  # "YYYY-MM" -> dollars invested this month
 
     equity_curve = []
 
     for ts, row in close.iterrows():
-        # Current calendar date & month in target TZ (index is already TZ-adjusted)
-        current_date  = ts.date()                 # per-day constraint
-        current_month = ts.strftime("%Y-%m")      # monthly cap bucket
+        current_date  = ts.date()            # daily limit
+        current_month = ts.strftime("%Y-%m") # monthly bucket
         month_spent = monthly_spend.get(current_month, 0.0)
 
-        # If monthly cap reached, skip all buys this bar
+        # If monthly cap reached, skip buys this bar
         if month_spent >= MONTHLY_CAP:
-            # compute equity and continue
             equity = state.cash + float(np.nansum([row[s]*state.positions[s] for s in close.columns]))
             equity_curve.append((ts, equity))
             continue
 
-        # Process signals for this timestamp
+        # Process signals
         sigs = signals.loc[ts]
         for sym, fire in sigs.items():
             if not fire:
                 continue
-
-            # Enforce one buy per asset per calendar day
             if last_buy_date[sym] == current_date:
-                continue
-
-            # Check monthly cap again before each buy
+                continue  # one buy per asset per day
             if monthly_spend.get(current_month, 0.0) >= MONTHLY_CAP:
-                break  # stop attempting buys this bar; cap reached
-
+                break      # cap reached at this bar
             px = row[sym]
             if not (np.isfinite(px) and px > 0):
                 continue
             if state.cash < BUY_AMOUNT:
-                continue  # out of cash
+                continue
 
-            # Execute buy ($BUY_AMOUNT)
+            # Execute buy
             qty = BUY_AMOUNT / px
             state.cash -= BUY_AMOUNT
             state.positions[sym] += qty
@@ -178,23 +181,34 @@ def run_backtest(close: pd.DataFrame, signals: pd.DataFrame) -> Tuple[pd.DataFra
             last_buy_date[sym] = current_date
             monthly_spend[current_month] = monthly_spend.get(current_month, 0.0) + BUY_AMOUNT
 
-            # If we hit the monthly cap exactly, stop further buys this bar
             if monthly_spend[current_month] >= MONTHLY_CAP:
                 break
 
-        # Compute equity after processing this bar
         equity = state.cash + float(np.nansum([row[s]*state.positions[s] for s in close.columns]))
         equity_curve.append((ts, equity))
 
     equity_df = pd.DataFrame(equity_curve, columns=["timestamp", "equity"]).set_index("timestamp")
-    return equity_df, state, buys_count
+    return equity_df, state, buys_count, monthly_spend
 
 
-def summarize(equity: pd.DataFrame, init_cash: float, state: PortfolioState, buys: Dict[str, int], close: pd.DataFrame) -> None:
+def summarize(
+    equity: pd.DataFrame,
+    init_cash: float,
+    state: PortfolioState,
+    buys: Dict[str, int],
+    close: pd.DataFrame,
+    monthly_spend: Dict[str, float],
+) -> None:
+    # Final equity & drawdown
     final_equity = float(equity["equity"].iloc[-1]) if not equity.empty else init_cash
-    total_return = (final_equity / init_cash - 1.0) * 100.0
-    peak = equity["equity"].cummax()
-    drawdown = (equity["equity"] / peak - 1.0)
+    if init_cash != 0.0:
+        total_return = (final_equity / init_cash - 1.0) * 100.0
+        total_return_str = f"{total_return:.2f}%"
+    else:
+        total_return_str = "N/A (INIT_CASH=0)"
+
+    peak = equity["equity"].cummax() if not equity.empty else pd.Series([init_cash])
+    drawdown = (equity["equity"] / peak - 1.0) if not equity.empty else pd.Series([0.0])
     max_dd = float(drawdown.min() * 100.0) if not drawdown.empty else 0.0
 
     invested = INIT_CASH - state.cash
@@ -203,19 +217,25 @@ def summarize(equity: pd.DataFrame, init_cash: float, state: PortfolioState, buy
     print(f"Universe: {list(close.columns)}")
     print(f"Initial Cash: ${init_cash:,.2f}")
     print(f"Total Invested: ${invested:,.2f}")
-    print(f"Final Equity: ${final_equity:,.2f}  |  Total Return: {total_return:.2f}%  |  Max DD: {max_dd:.2f}%")
+    print(f"Final Equity: ${final_equity:,.2f}  |  Total Return: {total_return_str}  |  Max DD: {max_dd:.2f}%")
 
     print("\n--- Buys per asset ---")
     for sym in close.columns:
-        print(f"{sym:>8}: {buys.get(sym,0)} buys | Last Price: {close[sym].iloc[-1]:.2f} | Position: {state.positions[sym]:.6f} units | Market Value: ${state.positions[sym]*close[sym].iloc[-1]:.2f}")
+        print(
+            f"{sym:>8}: {buys.get(sym,0)} buys | "
+            f"Last Price: {close[sym].iloc[-1]:.2f} | "
+            f"Position: {state.positions[sym]:.6f} units | "
+            f"Market Value: ${state.positions[sym]*close[sym].iloc[-1]:.2f}"
+        )
+
+    print("\n--- Monthly spend (applied vs cap) ---")
+    for month in sorted(monthly_spend.keys()):
+        spent = monthly_spend[month]
+        pct = min(100.0, (spent / MONTHLY_CAP) * 100.0 if MONTHLY_CAP > 0 else 0.0)
+        print(f"{month}: ${spent:,.2f} / ${MONTHLY_CAP:,.2f} ({pct:.0f}%)")
 
     print("\n--- Sample of last 10 equity points ---")
     print(equity.tail(10).to_string())
-
-    print("\n--- P&L by asset ---")
-    for sym in close.columns:
-        mv = state.positions[sym]*close[sym].iloc[-1]
-        print(f"{sym:>8}: Market Value ${mv:,.2f}")
 
 
 def main():
@@ -233,8 +253,8 @@ def main():
     close = close.dropna(how='all', axis=1)
 
     signals = build_signals(close)
-    equity, state, buys = run_backtest(close, signals)
-    summarize(equity, INIT_CASH, state, buys, close)
+    equity, state, buys, monthly_spend = run_backtest(close, signals)
+    summarize(equity, INIT_CASH, state, buys, close, monthly_spend)
 
 
 if __name__ == "__main__":
